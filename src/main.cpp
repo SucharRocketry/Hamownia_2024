@@ -1,149 +1,131 @@
-#include <Arduino.h>
-#include <SparkFun_Qwiic_Scale_NAU7802_Arduino_Library.h>
 #include <Wire.h>
-#include "FS.h"
-#include <LittleFS.h>
+#include <SparkFun_Qwiic_Scale_NAU7802_Arduino_Library.h>  // Poprawna biblioteka
+#include <LittleFS.h>                                      // System plików LittleFS
+#include <TaskScheduler.h>                                 // Biblioteka do zarządzania zadaniami
+#include <vector>
 
-#define FORMAT_LITTLEFS_IF_FAILED true
+#define SAMPLE_RATE 320          // Częstotliwość próbkowania 320Hz
+#define BUFFER_SIZE 128          // Rozmiar bufora zmniejszony
+#define FILE_NAME "/data.txt"    // Nazwa pliku na systemie LittleFS
 
-bool off = false;
-unsigned long aktualny_czas = 0;
-int currentIndex = 0;
+// Inicjalizacja czujnika NAU7802
+NAU7802 myScale;
 
+// Bufor do przechowywania danych
+struct DataPoint {
+  long value;
+  unsigned long timestamp;
+};
 
-NAU7802 myScale; //Create instance of the NAU7802 class
+std::vector<DataPoint> dataQueue;
+volatile bool isBufferFull = false;  // Flaga oznaczająca pełny bufor
 
-  struct DataFrame {
+// Task Scheduler
+Scheduler ts;
 
-    unsigned long zapamietanyCzas2;
-    float nacisk;
+// Funkcja do odczytu danych z czujnika
+void readSensor() {
+  // Odczytaj wartość z tensometru bezpośrednio
+  long value = myScale.getReading();  // Odczytaj pojedynczą wartość
+  unsigned long currentTime = millis();  // Pobierz aktualny czas w ms
 
-    String toString() {
+  // Blokada bufora
+  noInterrupts();
+  if (dataQueue.size() < BUFFER_SIZE) {
+    dataQueue.push_back({value, currentTime});  // Wstawienie wartości i znacznika czasowego do bufora
+  } else {
+    isBufferFull = true;
+  }
+  interrupts();
+}
 
-      char pomiar[20];
-      sprintf(pomiar, "%lu, %8.2f", zapamietanyCzas2, nacisk);
-      return String(pomiar);
-    }
-  };
+// Funkcja do zapisu danych na systemie plików
+void saveDataToFile() {
+  if (!LittleFS.exists(FILE_NAME)) {
+    File dataFile = LittleFS.open(FILE_NAME, "w");
+    dataFile.close();
+  }
 
- DataFrame pakiecik2[12500];
- uint8_t tempBuffer[sizeof(DataFrame)];
+  File dataFile = LittleFS.open(FILE_NAME, "a");
 
-
-
-void readFile(const char *path) {
-  Serial.printf("Reading file: %s\n", path);
-  File file = LittleFS.open(path, "r");
-  if (!file) {
-    Serial.println("Failed to open file for reading");
+  if (!dataFile) {
+    Serial.println("Nie można otworzyć pliku do zapisu!");
     return;
   }
 
-  Serial.print("Read from file: ");
-  while (file.available()) { Serial.write(file.read()); }
-  file.close();
+  while (!dataQueue.empty()) {
+    noInterrupts();
+    DataPoint dataPoint = dataQueue.front();  // Pobierz wartość i znacznik czasowy z bufora
+    dataQueue.erase(dataQueue.begin());       // Usuń pierwszy element (pop)
+    interrupts();
+
+    // Zapisz dane w formacie: "timestamp,value"
+    dataFile.print(dataPoint.timestamp);  // Zapisz znacznik czasowy
+    dataFile.print(",");                  // Separator
+    dataFile.println(dataPoint.value);    // Zapisz wartość
+  }
+
+  dataFile.close();
 }
 
-void deleteFile(fs::FS &fs, const char * path) {
-  Serial.printf("Deleting file: %s\r\n", path);
-  if (fs.remove(path)) {
-    Serial.println("- file deleted");
-  } 
-  else {
-    Serial.println("- delete failed");
+// Funkcja do wyświetlenia zawartości pliku data.txt
+void displayFileContents() {
+  if (LittleFS.exists(FILE_NAME)) {
+    File dataFile = LittleFS.open(FILE_NAME, "r");  // Otwórz plik do odczytu
+    if (dataFile) {
+      Serial.println("Zawartość pliku data.txt:");
+      while (dataFile.available()) {
+        String line = dataFile.readStringUntil('\n');  // Czytaj linia po linii
+        Serial.println(line);  // Wyświetl linie w konsoli
+      }
+      dataFile.close();
+    } else {
+      Serial.println("Błąd przy otwieraniu pliku data.txt.");
+    }
+  } else {
+    Serial.println("Plik data.txt nie istnieje.");
   }
 }
+
+// Zadanie do odczytu danych z czujnika
+Task taskReadSensor(1000 / SAMPLE_RATE, TASK_FOREVER, &readSensor);
+
+// Zadanie do zapisywania danych do pliku
+Task taskSaveData(1000 / SAMPLE_RATE, TASK_FOREVER, &saveDataToFile);
 
 void setup() {
   Serial.begin(115200);
-  Wire.begin();
-
-  pinMode(6, OUTPUT);
-
-  Serial.println("NAU7802");
-  if (! myScale.begin()) {
-    Serial.println("Failed to find NAU7802");
-  }
-  Serial.println("Found NAU7802");
-
-    if (!LittleFS.begin()) {
-    Serial.println("LITTLEFS Mount Failed");
-    off = true;
-  }
-
-   
-  delay(10000);         // czeka na ewntualne wpisanie "dane"
-
   
-  if (Serial.available() > 0)
-  {
-    String text = Serial.readString();
-    Serial.print(text);
-    if (text == ("dane\n"))     //sprawdza czy wpisane zostało "dane"
-    {
-      Serial.print("DANE");
-      digitalWrite(37, HIGH);
-      readFile("/data.txt");                //Czyta z pamięci flash
-
-      delay(10000);
-
-      off = true;
-
-      if (Serial.available() > 0)
-      {
-        text = Serial.readString();
-        if (text == ("usun\n")){
-          deleteFile(LittleFS, "/all.csv");
-          delay(100);
-      }}
-      digitalWrite(37, LOW);
-    }
+  // Inicjalizacja systemu plików
+  if (!LittleFS.begin()) {
+    Serial.println("Błąd montowania systemu plików.");
+    return;
   }
 
-myScale.setGain(NAU7802_GAIN_128); //Gain can be set to 1, 2, 4, 8, 16, 32, 64, or 128.
-
-myScale.setSampleRate(NAU7802_SPS_320); //Sample rate can be set to 10, 20, 40, 80, or 320Hz
-
-myScale.calibrateAFE(); //Does an internal calibration. Recommended after power up, gain changes, sample rate changes, or channel changes.
-  // Take 10 readings to flush out readings
+  // Wyświetl zawartość pliku data.txt przy starcie
+  displayFileContents();
   
+  // Inicjalizacja magistrali I2C
+  Wire.begin();  // Inicjalizuje magistralę I2C (domyślnie na pinach SDA/SCL)
 
-  while(off){
-    delay (10);
+  // Inicjalizacja czujnika NAU7802
+  if (!myScale.begin()) {
+    Serial.println("Nie można zainicjować NAU7802!");
+    return;
   }
 
+  // Ustaw częstotliwość próbkowania
+  myScale.setSampleRate(NAU7802_SPS_320);
+
+  // Dodaj zadania do planera
+  ts.addTask(taskReadSensor);
+  ts.addTask(taskSaveData);
+  
+  // Uruchom zadania
+  taskReadSensor.enable();
+  taskSaveData.enable();
 }
 
 void loop() {
-
-  while (! myScale.available()) {
-    delay(1);
-  }
-
-  int32_t val = myScale.getReading();
-  val = val/4.391825;
-  aktualny_czas = millis();
-  Serial.print("Read "); Serial.print(val); Serial.print(" czas "); Serial.println(aktualny_czas);
-
-      pakiecik2[currentIndex].zapamietanyCzas2 = aktualny_czas;
-      pakiecik2[currentIndex].nacisk = val;
-      currentIndex++;
-
-    if (currentIndex >= 12000) {
-    
-  
-    File file = LittleFS.open("/all.csv", "a");
-    digitalWrite(6, HIGH); 
-
-   for (int i = 0; i < 12000; i++) {
-       
-       memcpy(tempBuffer, &pakiecik2[i], sizeof(DataFrame));
-
-        file.write(tempBuffer, sizeof(DataFrame));
-    }
-
-    file.close();
-    digitalWrite(6, LOW);
-    currentIndex = 0;
-  }
+  ts.execute();  // Uruchomienie zadań planera
 }
